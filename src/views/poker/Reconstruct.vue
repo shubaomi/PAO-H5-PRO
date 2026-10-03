@@ -166,7 +166,8 @@ const finishReconstruct = () => {
 
 const completeFinish = () => {
   clearInterval(timerInterval.value)
-  const finalCards = reconstructionRow.value.filter(c => c !== null)
+  // Keep empty slots: scoring compares positions, not the order of filled cards.
+  const finalCards = [...reconstructionRow.value]
   store.setReconstructTime(currentTime.value)
   store.setReconstructedCards(finalCards)
   router.push('/poker/result')

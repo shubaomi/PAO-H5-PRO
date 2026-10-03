@@ -1,5 +1,5 @@
 哼却<script setup>
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useNumberTrainingStore } from '../../store/numberTraining';
 
@@ -84,6 +84,8 @@ function hardResetPageState() {
 // --- Component State & Logic ---
 
 const timerInterval = ref(null);
+let memoryDeadline = 0;
+let memoryDurationMs = 0;
 const hasEnded = ref(false);
 const generatedLocked = ref(false);
 const collapsedConfig = ref(false);
@@ -145,6 +147,18 @@ const updateDisplayMetrics = () => {
   const rect = m ? m.getBoundingClientRect() : null;
   charWidthPx.value = rect ? rect.width : 0;
 };
+
+// The number area is created only after training starts, so observe its ref
+// after rendering instead of trying to attach to a missing element on mount.
+watch(numberDisplayRef, (el) => {
+  numberDisplayResizeObserver?.disconnect();
+  numberDisplayResizeObserver = null;
+  updateDisplayMetrics();
+  if (el && typeof ResizeObserver !== 'undefined') {
+    numberDisplayResizeObserver = new ResizeObserver(updateDisplayMetrics);
+    numberDisplayResizeObserver.observe(el);
+  }
+}, { flush: 'post' });
 
 const groupsPerLine = computed(() => {
   const width = Number(displayWidthPx.value) || 0;
@@ -235,7 +249,36 @@ function onGenerateClick(event) {
   generateNumber();
 }
 
+function validateSettings() {
+  const { length, duration } = store.settings;
+  if (!Number.isInteger(length) || length < 10 || length > 200) {
+    addToast('数字长度请输入 10–200 之间的整数', 'error');
+    return false;
+  }
+  if (!Number.isInteger(duration) || duration < 1 || duration > 10) {
+    addToast('训练时长请输入 1–10 分钟的整数', 'error');
+    return false;
+  }
+  return true;
+}
+
+watch([() => store.settings.length, () => store.settings.mode], () => {
+  if (store.trainingStatus !== 'idle') return;
+  store.generatedNumber = '';
+  store.userInput = '';
+  generatedLocked.value = false;
+});
+
+const displayFontSize = computed(() => {
+  const width = displayWidthPx.value;
+  const groupSize = Number(store.settings.groupSize) || 6;
+  if (!width) return 32;
+  // Fit a whole group plus its separator after the fixed line-number column.
+  return Math.min(32, Math.max(12, (width - 62) / (groupSize * 0.85 + 1)));
+});
+
 function generateNumber() {
+  if (!validateSettings()) return;
   const { length, mode } = store.settings;
   if (mode === 'no-repeat' && length > 10) {
     addToast('无重复模式下长度不能超过10', 'error');
@@ -263,6 +306,7 @@ function generateNumber() {
 
 
 function startTraining() {
+  if (!validateSettings()) return;
   if (!store.generatedNumber) {
     addToast('请先生成随机数字', 'error');
     return;
@@ -284,25 +328,17 @@ function startTraining() {
   store.results.totalTimeMs = 0;
 
 
-  store.timer.remainingTime = store.settings.duration * 60 * 1000;
+  memoryDurationMs = store.settings.duration * 60 * 1000;
+  store.timer.remainingTime = memoryDurationMs;
   store.timer.isActive = true;
   store.timer.isPaused = false;
 
-  timerInterval.value = setInterval(() => {
-    if (hasEnded.value) {
-      clearInterval(timerInterval.value);
-      return;
-    }
-    store.timer.remainingTime -= 1000;
-    if (store.timer.remainingTime <= 0) {
-      store.timer.remainingTime = 0;
-      endTraining('auto');
-    }
-  }, 1000);
+  startInterval();
 }
 
 
 function pauseTraining() {
+  updateRemainingTime();
   store.timer.isPaused = true;
   clearInterval(timerInterval.value);
 }
@@ -315,6 +351,8 @@ function resumeTraining() {
 function endTraining(source = 'manual') {
   if (hasEnded.value) return;
   if (source === 'manual') {
+    const wasPaused = store.timer.isPaused;
+    if (!wasPaused) updateRemainingTime();
     clearInterval(timerInterval.value);
     store.timer.isPaused = true;
     showModal({
@@ -322,8 +360,8 @@ function endTraining(source = 'manual') {
       message: '确定要结束记忆并进入回忆阶段吗？',
       onConfirm: () => switchToRecalling(),
       onCancel: () => {
-        store.timer.isPaused = false;
-        startInterval();
+        store.timer.isPaused = wasPaused;
+        if (!wasPaused) startInterval();
       }
     });
     return;
@@ -352,17 +390,23 @@ function switchToRecalling() {
 
 
 function startInterval() {
+    clearInterval(timerInterval.value);
+    memoryDeadline = Date.now() + store.timer.remainingTime;
     timerInterval.value = setInterval(() => {
         if (hasEnded.value) {
             clearInterval(timerInterval.value);
             return;
         }
-        store.timer.remainingTime -= 1000;
+        updateRemainingTime();
         if (store.timer.remainingTime <= 0) {
             store.timer.remainingTime = 0;
             endTraining('auto');
         }
     }, 1000);
+}
+
+function updateRemainingTime() {
+  store.timer.remainingTime = Math.max(0, memoryDeadline - Date.now());
 }
 
 
@@ -380,10 +424,9 @@ function submitAnswer() {
             stopRecallTimer();
 
             const endAt = Date.now();
-            const startAt = trainingStartAt.value || endAt;
             const recallStart = recallStartAt.value || endAt;
 
-            const memoryMs = Math.max(0, recallStart - startAt);
+            const memoryMs = Math.max(0, memoryDurationMs - store.timer.remainingTime);
             const recallMs = Math.max(0, endAt - recallStart);
 
             // 统计区只展示到“秒”，因此先截断到秒再相加，保证：
@@ -408,14 +451,14 @@ function submitAnswer() {
 
 function calculateResults() {
   const original = store.generatedNumber;
-  const userInput = store.userInput.replace(/\s+/g, '');
+  const userInput = store.userInput;
   const len = Math.max(original.length, userInput.length);
   let correctCount = 0;
   let comparison = [];
 
   for (let i = 0; i < len; i++) {
     const originalChar = original[i];
-    const userChar = userInput[i];
+    const userChar = userInput[i] === ' ' ? undefined : userInput[i];
 
     if (originalChar !== undefined && userChar !== undefined) {
       if (originalChar === userChar) {
@@ -471,8 +514,28 @@ const collapsedHistory = ref(true);
 
 
 function loadHistory() {
-    const data = localStorage.getItem(HISTORY_KEY);
-    if (data) history.value = JSON.parse(data);
+    try {
+      const data = localStorage.getItem(HISTORY_KEY);
+      const records = data ? JSON.parse(data) : [];
+      if (!Array.isArray(records) || records.some(record => !record || typeof record !== 'object' || !Number.isFinite(record.accuracy))) {
+        throw new Error('Invalid history');
+      }
+      history.value = records;
+    } catch {
+      history.value = [];
+      addToast('历史记录无法读取，原始数据未改动', 'error');
+    }
+}
+
+function persistHistory(records) {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(records));
+      history.value = records;
+      return true;
+    } catch {
+      addToast('历史记录保存失败，请检查浏览器存储空间或权限', 'error');
+      return false;
+    }
 }
 
 function saveHistory() {
@@ -487,8 +550,7 @@ function saveHistory() {
             userInput: store.userInput
         }
     };
-    history.value.unshift(newRecord);
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.value));
+    if (!persistHistory([newRecord, ...history.value])) return;
     collapsedHistory.value = false;
     addToast('记录已保存!');
 }
@@ -500,8 +562,7 @@ function deleteHistory(id) {
         message: '确定要删除这条历史记录吗？',
         confirmText: '确定',
         onConfirm: () => {
-            history.value = history.value.filter(record => record.id !== id);
-            localStorage.setItem(HISTORY_KEY, JSON.stringify(history.value));
+            if (!persistHistory(history.value.filter(record => record.id !== id))) return;
             addToast('记录已删除', 'info');
         }
     });
@@ -514,8 +575,7 @@ function clearHistory() {
         message: '确定要清空所有历史记录吗？此操作不可撤销。',
         confirmText: '全部清空',
         onConfirm: () => {
-            history.value = [];
-            localStorage.removeItem(HISTORY_KEY);
+            if (!persistHistory([])) return;
             addToast('历史记录已清空', 'info');
         }
     });
@@ -623,10 +683,6 @@ onMounted(() => {
 
   nextTick(() => {
     updateDisplayMetrics();
-    if (typeof ResizeObserver !== 'undefined') {
-      numberDisplayResizeObserver = new ResizeObserver(() => updateDisplayMetrics());
-      if (numberDisplayRef.value) numberDisplayResizeObserver.observe(numberDisplayRef.value);
-    }
     window.addEventListener('resize', updateDisplayMetrics, { passive: true });
   });
 });
@@ -704,7 +760,7 @@ onBeforeUnmount(() => {
             <span class="timer-display">{{ formattedTime }}</span>
         </div>
         <div class="number-display-wrapper" v-show="isMemorizing || (isFinished && store.generatedNumber)">
-          <div ref="numberDisplayRef" class="number-lines">
+          <div ref="numberDisplayRef" class="number-lines" :style="{ fontSize: `${displayFontSize}px` }">
             <div v-for="(line, lineIdx) in generatedNumberLines" :key="`line-${lineIdx}`" class="number-line">
               <div class="line-no">{{ lineIdx + 1 }}</div>
               <div class="line-content">
@@ -1048,7 +1104,7 @@ onBeforeUnmount(() => {
   flex: 1;
   display: inline-flex;
   align-items: flex-end;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 10px 6px;
   min-width: 0;
 }
